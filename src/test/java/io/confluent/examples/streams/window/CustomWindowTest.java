@@ -27,15 +27,7 @@ import org.apache.kafka.streams.StreamsBuilder;
 import org.apache.kafka.streams.StreamsConfig;
 import org.apache.kafka.streams.Topology;
 import org.apache.kafka.streams.TopologyTestDriver;
-import org.apache.kafka.streams.kstream.KStream;
-import org.apache.kafka.streams.kstream.KTable;
-import org.apache.kafka.streams.kstream.Materialized;
-import org.apache.kafka.streams.kstream.Printed;
-import org.apache.kafka.streams.kstream.Produced;
-import org.apache.kafka.streams.kstream.Suppressed;
-import org.apache.kafka.streams.kstream.TimeWindowedDeserializer;
-import org.apache.kafka.streams.kstream.Windowed;
-import org.apache.kafka.streams.kstream.WindowedSerdes;
+import org.apache.kafka.streams.kstream.*;
 import org.apache.kafka.streams.kstream.internals.TimeWindow;
 import org.apache.kafka.streams.test.ConsumerRecordFactory;
 import org.apache.kafka.streams.test.OutputVerifier;
@@ -49,11 +41,13 @@ import java.time.ZonedDateTime;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
+import java.util.logging.Logger;
 import java.util.stream.Collectors;
 
 
 public class CustomWindowTest {
 
+    Logger LOGGER = Logger.getLogger(CustomWindowTest.class.getName());
     private static final String inputTopic = "inputTopic";
     private static final String outputTopic = "outputTopic";
     private static final ZoneId zone = ZoneOffset.UTC;
@@ -75,6 +69,38 @@ public class CustomWindowTest {
         );
         verify(inputValues, expectedValues, zone);
     }
+
+    @Test
+    public void shouldSumNumbersByHours() {
+        final List<MyEvent> inputValues = Arrays.asList(
+
+                new MyEvent(1, ZonedDateTime.of(2019, 1, 1, 17, 19, 0, 0, zone)),
+                new MyEvent(2, ZonedDateTime.of(2019, 1, 1, 17, 20, 0, 0, zone)),
+                new MyEvent(7, ZonedDateTime.of(2019, 1, 1, 17, 21, 0, 0, zone)),
+
+                new MyEvent(1, ZonedDateTime.of(2019, 1, 1, 16, 29, 0, 0, zone)),
+                new MyEvent(2, ZonedDateTime.of(2019, 1, 1, 16, 30, 0, 0, zone)),
+                new MyEvent(7, ZonedDateTime.of(2019, 1, 1, 16, 31, 0, 0, zone)),
+
+                new MyEvent(1, ZonedDateTime.of(2019, 1, 1, 16, 39, 0, 0, zone)),
+                new MyEvent(2, ZonedDateTime.of(2019, 1, 1, 16, 40, 0, 0, zone)),
+                new MyEvent(7, ZonedDateTime.of(2019, 1, 1, 16, 41, 0, 0, zone)),
+
+                new MyEvent(1, ZonedDateTime.of(2019, 1, 1, 17, 49, 0, 0, zone)),
+                new MyEvent(2, ZonedDateTime.of(2019, 1, 1, 17, 50, 0, 0, zone)),
+                new MyEvent(7, ZonedDateTime.of(2019, 1, 1, 17, 51, 0, 0, zone)),
+
+                dummyEventToForceSuppression()
+        );
+        final List<ExpectedResult> expectedValues = Arrays.asList(
+                new ExpectedResult(1,
+                        10,
+                        ZonedDateTime.of(2018, 12, 31, 18, 0, 0, 0, zone),
+                        ZonedDateTime.of(2019, 1, 1, 18, 0, 0, 0, zone))
+        );
+        verifyByHour(inputValues, expectedValues, zone);
+    }
+
 
     @Test
     public void shouldSumNumbersWithTwoWindows() {
@@ -208,6 +234,30 @@ public class CustomWindowTest {
         testDriver.close();
     }
 
+    private void verifyByHour(final List<MyEvent> inputValues, final List<ExpectedResult> expectedValues, final ZoneId zoneId) {
+
+        final Properties streamsConfiguration = new Properties();
+        streamsConfiguration.put(StreamsConfig.APPLICATION_ID_CONFIG, "sum-lambda-integration-test");
+        streamsConfiguration.put(StreamsConfig.BOOTSTRAP_SERVERS_CONFIG, "dummy:1234");
+        streamsConfiguration.put(StreamsConfig.DEFAULT_KEY_SERDE_CLASS_CONFIG, Serdes.Integer().getClass().getName());
+        streamsConfiguration.put(StreamsConfig.DEFAULT_VALUE_SERDE_CLASS_CONFIG, Serdes.Integer().getClass().getName());
+        // The commit interval for flushing records to state stores and downstream must be lower than
+        // this integration test's timeout (30 secs) to ensure we observe the expected processing results.
+        streamsConfiguration.put(StreamsConfig.COMMIT_INTERVAL_MS_CONFIG, 10 * 1000);
+        streamsConfiguration.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        // Use a temporary directory for storing state, which will be automatically removed after the test.
+        streamsConfiguration.put(StreamsConfig.STATE_DIR_CONFIG, TestUtils.tempDirectory().getAbsolutePath());
+
+        final Topology topology = buildKafkaStreamTopologyByHour(zoneId);
+
+        final TopologyTestDriver testDriver = new TopologyTestDriver(topology, streamsConfiguration);
+
+        injectFakeData(inputValues, testDriver);
+        verifyResultsByHour(expectedValues, testDriver);
+
+        testDriver.close();
+    }
+
     private Topology buildKafkaStreamTopology(final ZoneId zoneId) {
         final StreamsBuilder builder = new StreamsBuilder();
 
@@ -215,7 +265,29 @@ public class CustomWindowTest {
         final KStream<Windowed<Integer>, Integer> sumOfOddNumbers = input
                 .selectKey((k, v) -> 1)
                 .groupByKey()
+//                .windowedBy(new HourlyTimeWindows(zoneId, windowStartHour, Duration.ofMinutes(30)))
                 .windowedBy(new DailyTimeWindows(zoneId, windowStartHour, Duration.ofMinutes(30)))
+                // A simple sum of value
+                .reduce((v1, v2) -> v1 + v2, Materialized.with(Serdes.Integer(), Serdes.Integer()))
+                // We only care about final result
+                .suppress(Suppressed.untilWindowCloses(Suppressed.BufferConfig.unbounded()))
+                .toStream();
+        sumOfOddNumbers.print(Printed.toSysOut());
+        sumOfOddNumbers.to(outputTopic, Produced.with(WindowedSerdes.timeWindowedSerdeFrom(Integer.class), Serdes.Integer()));
+        return builder.build();
+
+    }
+
+
+    private Topology buildKafkaStreamTopologyByHour(final ZoneId zoneId) {
+        final StreamsBuilder builder = new StreamsBuilder();
+
+        final KStream<String, Integer> input = builder.stream(inputTopic);
+        final KStream<Windowed<Integer>, Integer> sumOfOddNumbers = input
+                .selectKey((k, v) -> 1)
+                .groupByKey()
+//                .windowedBy(new HourlyTimeWindows(zoneId, windowStartHour, Duration.ofMinutes(30)))
+                .windowedBy(new HourlyTimeWindows(zoneId, windowStartHour, Duration.ofMinutes(30)))
                 // A simple sum of value
                 .reduce((v1, v2) -> v1 + v2, Materialized.with(Serdes.Integer(), Serdes.Integer()))
                 // We only care about final result
@@ -255,9 +327,21 @@ public class CustomWindowTest {
         }
     }
 
+    private void verifyResultsByHour(final List<ExpectedResult> expectedValues, final TopologyTestDriver testDriver) {
+        LOGGER.info("size is "+ expectedValues.size());
+        for (final ExpectedResult expectedValue : expectedValues) {
+            final ProducerRecord<Windowed<Integer>, Integer> results = testDriver.readOutput(outputTopic, new TimeWindowedDeserializer(new IntegerDeserializer(), Duration.ofHours(1).toMillis()), new IntegerDeserializer());
+            LOGGER.info("Expected <" + expectedValue.toWindowed().key() + ", " + expectedValue.value + "> but was <" + results.key() + ", " + results.value() + ">");
+            OutputVerifier.compareKeyValue(results, expectedValue.toWindowed(), expectedValue.value);
+
+        }
+    }
+
     private void verifyResults(final List<ExpectedResult> expectedValues, final TopologyTestDriver testDriver) {
+        LOGGER.info("size is "+ expectedValues.size());
         for (final ExpectedResult expectedValue : expectedValues) {
             final ProducerRecord<Windowed<Integer>, Integer> results = testDriver.readOutput(outputTopic, new TimeWindowedDeserializer(new IntegerDeserializer(), Duration.ofDays(1).toMillis()), new IntegerDeserializer());
+            LOGGER.info("Expected <" + expectedValue.toWindowed().key() + ", " + expectedValue.value + "> but was <" + results.key() + ", " + results.value() + ">");
             OutputVerifier.compareKeyValue(results, expectedValue.toWindowed(), expectedValue.value);
 
         }
